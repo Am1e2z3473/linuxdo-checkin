@@ -5,6 +5,8 @@ new Env("Linux.Do 签到")
 
 import os
 import random
+import re
+import sys
 import time
 import functools
 from loguru import logger
@@ -104,29 +106,42 @@ class LinuxDoBrowser:
         解析浏览器复制的 Cookie 字符串格式: "name1=value1; name2=value2"
         返回 DrissionPage 所需的 cookie 列表格式。
         """
+        cookie_str = cookie_str.strip()
+        if cookie_str.lower().startswith("cookie:"):
+            cookie_str = cookie_str.split(":", 1)[1].strip()
+        format_error = (
+            "LINUXDO_COOKIES 格式错误：请填写完整的 Cookie 请求头值，"
+            "格式为 名称=值; 名称2=值2（例如 _t=xxx; _forum_session=yyy），"
+            "不能只填写浏览器 Cookie 表格中的 Value。"
+        )
+        if not cookie_str or "\r" in cookie_str or "\n" in cookie_str:
+            raise ValueError(format_error)
+
         cookies = []
-        for part in cookie_str.strip().split(";"):
+        for part in cookie_str.split(";"):
             part = part.strip()
-            if "=" in part:
-                name, _, value = part.partition("=")
-                cookies.append(
-                    {
-                        "name": name.strip(),
-                        "value": value.strip(),
-                        "domain": ".linux.do",
-                        "path": "/",
-                    }
-                )
+            if not part:
+                continue
+            name, separator, value = part.partition("=")
+            name = name.strip()
+            if not separator or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+                raise ValueError(format_error)
+            cookies.append(
+                {
+                    "name": name,
+                    "value": value.strip(),
+                    "domain": ".linux.do",
+                    "path": "/",
+                }
+            )
+        if not cookies:
+            raise ValueError(format_error)
         return cookies
 
     def login_with_cookies(self, cookie_str: str) -> bool:
         """使用手动设置的 Cookie 直接登录，跳过账号密码流程"""
         logger.info("检测到手动 Cookie，尝试 Cookie 登录...")
         dp_cookies = self.parse_cookie_string(cookie_str)
-        if not dp_cookies:
-            logger.error("Cookie 解析失败或为空，无法使用 Cookie 登录")
-            return False
-
         logger.info(f"成功解析 {len(dp_cookies)} 个 Cookie 条目")
 
         # 同步到 requests.Session，以便后续 API 请求（如 print_connect_info）使用
@@ -144,12 +159,9 @@ class LinuxDoBrowser:
             user_ele = self.page.ele("@id=current-user")
         except Exception as e:
             logger.warning(f"Cookie 登录验证异常: {str(e)}")
-            return True
+            return False
         if not user_ele:
-            if "avatar" in self.page.html:
-                logger.info("Cookie 登录验证成功 (通过 avatar)")
-                return True
-            logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
+            logger.error("Cookie 登录验证失败 (未找到 current-user)，请检查 Cookie 是否有效及页面是否被验证拦截")
             return False
         else:
             logger.info("Cookie 登录验证成功")
@@ -204,7 +216,11 @@ class LinuxDoBrowser:
                 logger.info("登录成功!")
             else:
                 logger.error(f"登录失败，状态码: {resp_login.status_code}")
-                logger.error(resp_login.text)
+                if (
+                    resp_login.headers.get("cf-mitigated", "").lower() == "challenge"
+                    or "<title>just a moment" in resp_login.text.lower()
+                ):
+                    logger.error("登录请求遇到网站验证页面；请先在浏览器确认可以正常登录，并检查有效的完整 Cookie。修正格式不能保证通过网站验证。")
                 return False
         except Exception as e:
             logger.error(f"登录请求异常: {e}")
@@ -236,12 +252,8 @@ class LinuxDoBrowser:
             user_ele = self.page.ele("@id=current-user")
         except Exception as e:
             logger.warning(f"登录验证失败: {str(e)}")
-            return True
+            return False
         if not user_ele:
-            # Fallback check for avatar
-            if "avatar" in self.page.html:
-                logger.info("登录验证成功 (通过 avatar)")
-                return True
             logger.error("登录验证失败 (未找到 current-user)")
             return False
         else:
@@ -306,23 +318,32 @@ class LinuxDoBrowser:
         try:
             # 优先使用手动 Cookie 登录，没有再使用账号密码
             if COOKIES:
-                login_res = self.login_with_cookies(COOKIES)
+                try:
+                    login_res = self.login_with_cookies(COOKIES)
+                except ValueError as e:
+                    logger.error(str(e))
+                    return False
                 if not login_res:
+                    if not USERNAME or not PASSWORD:
+                        logger.error("Cookie 登录失败，且未配置完整账号密码，程序终止")
+                        return False
                     logger.warning("Cookie 登录失败，尝试账号密码登录...")
                     login_res = self.login()
             else:
                 login_res = self.login()
             if not login_res:  # 登录
-                logger.warning("登录验证失败")
+                logger.error("登录验证失败，程序终止")
+                return False
 
             if BROWSE_ENABLED:
                 click_topic_res = self.click_topic()  # 点击主题
                 if not click_topic_res:
                     logger.error("点击主题失败，程序终止")
-                    return
+                    return False
                 logger.info("完成浏览任务")
             self.print_connect_info()  # 打印连接信息
             self.send_notifications(BROWSE_ENABLED)  # 发送通知
+            return True
         finally:
             try:
                 self.page.close()
@@ -383,6 +404,6 @@ class LinuxDoBrowser:
 if __name__ == "__main__":
     if not COOKIES and (not USERNAME or not PASSWORD):
         print("请设置 LINUXDO_COOKIES（Cookie 登录），或同时设置 USERNAME 和 PASSWORD（账号密码登录）")
-        exit(1)
+        sys.exit(1)
     browser = LinuxDoBrowser()
-    browser.run()
+    sys.exit(0 if browser.run() else 1)
